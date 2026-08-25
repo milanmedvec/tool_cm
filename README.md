@@ -1,4 +1,4 @@
-# cm
+# tool_cm
 
 Standalone extraction from `workspace_archlinux_i3wm`.
 
