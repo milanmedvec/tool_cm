@@ -8,25 +8,17 @@ Small runc-based container image manager backed by Docker exports and OCI config
 
 ## Dependencies
 
+Required shell:
+- Bash
+
 Required commands:
-- `bash`
 - `docker`
 - `runc`
 - `jq`
 - `tar`
 - `mktemp`
 
-Check required commands in your shell:
-
-```bash
-need() {
-    command -v "$1" >/dev/null || echo "missing: $1"
-}
-
-for cmd in bash docker runc jq tar mktemp; do
-    need "$cmd"
-done
-```
+The executable scripts call `need` for required commands before using them.
 
 ## Install
 

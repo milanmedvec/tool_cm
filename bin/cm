@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf '%s: missing required command: %s\n' "${0##*/}" "$1" >&2
+        exit 127
+    }
+}
+
+need docker
+need runc
+need jq
+need tar
+need mktemp
+
+
 DATA="$HOME/.local/share/cm"
 
 bootstrap() {
