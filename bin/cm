@@ -1,0 +1,378 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DATA="$HOME/.local/share/cm"
+
+bootstrap() {
+    [[ -d "$DATA" ]] || mkdir -p "$DATA"
+}
+
+require_image() {
+    local name="$1"
+    if [[ ! -d "$DATA/$name" ]]; then
+        echo "Error: no image '$name'." >&2
+        exit 1
+    fi
+}
+
+list() {
+    local found=0
+
+    for image_dir in "$DATA"/*/; do
+        [[ -d "$image_dir" ]] || continue
+
+        local id
+        id=$(basename "$image_dir")
+
+        local entrypoint=""
+        if [[ -f "$image_dir/config.json" ]]; then
+            entrypoint=$(jq -r '.process.args[0] // ""' "$image_dir/config.json" 2>/dev/null || true)
+        fi
+
+        printf "%-18s  %s\n" "$id" "$entrypoint"
+        found=1
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "No images found. Use 'cm create' to create one."
+    fi
+}
+
+create() {
+    if [[ $# -eq 0 || "$1" == -* ]]; then
+        echo "Error: 'cm create' requires a name (e.g. cm create im1)." >&2
+        exit 1
+    fi
+
+    local name="$1"
+    shift
+
+    local entrypoint="/bin/bash"
+    local project=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --entrypoint|-e)
+                entrypoint="$2"
+                shift 2
+                ;;
+            --project|-p)
+                project="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: unknown option '$1'" >&2
+                exit 1
+                ;;
+            *)
+                echo "Error: unexpected argument '$1'" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    local bundle="$DATA/$name"
+
+    if [[ -d "$bundle" ]]; then
+        echo "Error: image '$name' already exists." >&2
+        exit 1
+    fi
+
+    mkdir -p "$bundle/rootfs"
+
+    echo "Creating image '$name'..."
+    echo "Exporting debian:latest rootfs (this may take a moment)..."
+    local cid
+    cid=$(docker create debian:latest)
+    docker export "$cid" | tar -C "$bundle/rootfs" -xf -
+    docker rm "$cid" > /dev/null
+
+    echo "nameserver 8.8.8.8" > "$bundle/rootfs/etc/resolv.conf"
+    echo "127.0.0.1        localhost" > "$bundle/rootfs/etc/hosts"
+    chmod 1777 "$bundle/rootfs/tmp"
+
+    echo "Generating rootless runc spec..."
+    runc spec --rootless --bundle "$bundle"
+
+    [[ -n "$project" ]] && mkdir -p "$bundle/rootfs/project"
+
+    echo "Patching config.json (entrypoint: $entrypoint)..."
+    patch_config "$bundle" "$entrypoint" "$project"
+
+    echo "Image created: $name"
+}
+
+patch_config() {
+    local bundle="$1"
+    local entrypoint="$2"
+    local project="${3:-}"
+    local config="$bundle/config.json"
+    local caps='[
+        "CAP_AUDIT_WRITE","CAP_KILL","CAP_NET_BIND_SERVICE",
+        "CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER",
+        "CAP_MKNOD","CAP_NET_RAW","CAP_SETGID","CAP_SETUID",
+        "CAP_SETFCAP","CAP_SETPCAP","CAP_SYS_CHROOT"
+    ]'
+    local uid_gid_maps='[
+        {"containerID": 0, "hostID": 1000, "size": 1},
+        {"containerID": 1, "hostID": 100000, "size": 65536}
+    ]'
+
+    jq \
+        --argjson caps "$caps" \
+        --argjson maps "$uid_gid_maps" \
+        --arg ep "$entrypoint" \
+        --arg project "$project" \
+        '
+            .root.readonly = false |
+            .process.cwd = (if $project != "" then "/project" else "/" end) |
+            .process.args = [$ep] |
+            .process.capabilities.bounding   = $caps |
+            .process.capabilities.effective  = $caps |
+            .process.capabilities.permitted  = $caps |
+            .linux.uidMappings = $maps |
+            .linux.gidMappings = $maps |
+            .linux.namespaces = [.linux.namespaces[] | select(.type != "network")] |
+            .mounts += [{
+                "destination": "/etc/resolv.conf",
+                "type": "none",
+                "source": "/etc/resolv.conf",
+                "options": ["rbind", "ro"]
+            }] |
+            .mounts += [{
+                "destination": "/etc/hosts",
+                "type": "none",
+                "source": "/etc/hosts",
+                "options": ["rbind", "ro"]
+            }] |
+            if $project != "" then .mounts += [{
+                "destination": "/project",
+                "type": "none",
+                "source": $project,
+                "options": ["rbind", "rw"]
+            }] else . end
+        ' "$config" > "$config.tmp" && mv "$config.tmp" "$config"
+}
+
+delete() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: 'cm delete' requires a name." >&2
+        exit 1
+    fi
+    local id="$1"
+    require_image "$id"
+    local bundle="$DATA/$id"
+
+    local containers
+    containers=$(runc list --format json 2>/dev/null \
+        | jq -r --arg bundle "$bundle" '.[] | select(.bundle == $bundle) | .id' 2>/dev/null \
+        || true)
+
+    for cid in $containers; do
+        local status
+        status=$(runc state "$cid" 2>/dev/null \
+            | jq -r '.status' 2>/dev/null \
+            || echo "unknown")
+
+        if [[ "$status" == "running" || "$status" == "paused" ]]; then
+            echo "Killing container '$cid'..."
+            runc kill "$cid" KILL 2>/dev/null || true
+            sleep 1
+        fi
+
+        echo "Deleting container '$cid'..."
+        runc delete "$cid" 2>/dev/null || true
+    done
+
+    echo "Removing image '$id'..."
+    rm -rf "$bundle"
+    echo "Done."
+}
+
+parse_memory() {
+    local mem="${1,,}"
+    if [[ "$mem" =~ ^([0-9]+)g$ ]]; then
+        echo $(( ${BASH_REMATCH[1]} * 1024 * 1024 * 1024 ))
+    elif [[ "$mem" =~ ^([0-9]+)m$ ]]; then
+        echo $(( ${BASH_REMATCH[1]} * 1024 * 1024 ))
+    elif [[ "$mem" =~ ^([0-9]+)k$ ]]; then
+        echo $(( ${BASH_REMATCH[1]} * 1024 ))
+    elif [[ "$mem" =~ ^[0-9]+$ ]]; then
+        echo "$mem"
+    else
+        echo "Error: invalid memory format '$1' (use e.g. 512m, 2g, 1024k)" >&2
+        exit 1
+    fi
+}
+
+run() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: 'cm run' requires an image id." >&2
+        exit 1
+    fi
+
+    local id="$1"
+    shift
+    require_image "$id"
+
+    local memory=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --memory|-m)
+                memory="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: unknown option '$1'" >&2
+                exit 1
+                ;;
+            *)
+                echo "Error: unexpected argument '$1'" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    local bundle="$DATA/$id"
+    local run_bundle
+    run_bundle=$(mktemp -d)
+
+    local jq_filter='.root.path = $rootfs | .process.cwd = "/project" | .mounts = [.mounts[] | select(.destination != "/project")] | .mounts += [{"destination":"/project","type":"none","source":$pwd,"options":["rbind","rw"]}]'
+    local jq_args=(--arg rootfs "$bundle/rootfs" --arg pwd "$PWD")
+
+    if [[ -n "$memory" ]]; then
+        local limit
+        limit=$(parse_memory "$memory")
+        jq_args+=(--argjson limit "$limit")
+        jq_filter+=' | .linux.resources.memory.limit = $limit'
+        echo "Memory limit: $memory ($limit bytes)"
+    fi
+
+    jq "${jq_args[@]}" "$jq_filter" "$bundle/config.json" > "$run_bundle/config.json"
+
+    echo "Mounting $PWD -> /project"
+    local cid="${id}-$(date +%s)"
+    echo "Starting container '$cid'..."
+    runc run --bundle "$run_bundle" "$cid"
+
+    rm -rf "$run_bundle"
+}
+
+build() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: 'cm build' requires an image id." >&2
+        exit 1
+    fi
+
+    local id="$1"
+    require_image "$id"
+    local bundle="$DATA/$id"
+
+    local tmp_bundle
+    tmp_bundle=$(mktemp -d)
+
+    jq --arg rootfs "$bundle/rootfs" \
+        '.process.args = ["/bin/bash"] | .root.path = $rootfs' \
+        "$bundle/config.json" > "$tmp_bundle/config.json"
+
+    local cid="${id}-build-$(date +%s)"
+    echo "Opening build shell for '$id' (changes to rootfs will persist)..."
+    runc run --bundle "$tmp_bundle" "$cid" || true
+
+    rm -rf "$tmp_bundle"
+}
+
+config() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: 'cm config' requires an image id." >&2
+        exit 1
+    fi
+
+    local id="$1"
+    shift
+    require_image "$id"
+
+    local bundle="$DATA/$id"
+    local config="$bundle/config.json"
+
+    if [[ $# -eq 0 ]]; then
+        echo "name:       $id"
+        echo "entrypoint: $(jq -r '.process.args | join(" ")' "$config")"
+        echo "cwd:        $(jq -r '.process.cwd' "$config")"
+        echo "project:    $(jq -r '(.mounts[] | select(.destination == "/project") | .source) // "(none)"' "$config")"
+        return
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --entrypoint|-e)
+                jq --arg v "$2" '.process.args = [$v]' \
+                    "$config" > "$config.tmp" && mv "$config.tmp" "$config"
+                echo "entrypoint set to '$2'"
+                shift 2
+                ;;
+            --cwd|-w)
+                jq --arg v "$2" '.process.cwd = $v' \
+                    "$config" > "$config.tmp" && mv "$config.tmp" "$config"
+                echo "cwd set to '$2'"
+                shift 2
+                ;;
+            --project|-p)
+                mkdir -p "$bundle/rootfs/project"
+                jq --arg v "$2" '
+                    .mounts = [.mounts[] | select(.destination != "/project")] |
+                    .mounts += [{"destination":"/project","type":"none","source":$v,"options":["rbind","rw"]}]
+                ' "$config" > "$config.tmp" && mv "$config.tmp" "$config"
+                echo "project mount set to '$2'"
+                shift 2
+                ;;
+            *)
+                echo "Error: unknown option '$1'" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+help() {
+    cat <<EOF
+cm - runc container manager
+
+Usage:
+  cm <command> [options]
+
+Commands:
+  list                                  List all images
+  create <name> [--entrypoint|-e <path>] [--project|-p <path>]
+                                        Create a new image
+  run <name> [--memory|-m <limit>]      Run a container from an image
+                                        Memory limit examples: 512m, 2g, 1024k
+  build <name>                          Open interactive shell to modify rootfs (changes persist)
+  delete <name>                         Delete an image
+  config <name>                         Show image config
+  config <name> --entrypoint|-e <path>  Change the entrypoint
+  config <name> --cwd|-w <path>         Change the working directory inside container
+  config <name> --project|-p <path>     Change the host path mounted at /project
+
+Data directory: $DATA
+EOF
+}
+
+main() {
+    bootstrap
+
+    case "${1:-}" in
+        list)    list ;;
+        create)  create "${@:2}" ;;
+        run)     run "${@:2}" ;;
+        build)   build "${@:2}" ;;
+        delete)  delete "${@:2}" ;;
+        config)  config "${@:2}" ;;
+        help)    help ;;
+        *)       help; exit 1 ;;
+    esac
+}
+
+main "$@"
